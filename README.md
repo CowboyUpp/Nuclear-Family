@@ -123,3 +123,5 @@ Next step will be:
 3. Apply `schema.sql`.
 4. Add `STEWARD_TOKEN`.
 5. Test `/health`.
+
+Deployment test after merge.
