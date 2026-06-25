@@ -1,0 +1,21 @@
+{
+  "race_id": "test-race-001",
+  "scraped_at": "2026-06-24T12:00:00.000Z",
+  "results": [
+    {
+      "position": "1st",
+      "name": "CowboyUpp",
+      "time": "01:23.456"
+    },
+    {
+      "position": "2nd",
+      "name": "DriverTwo",
+      "time": "01:24.111"
+    },
+    {
+      "position": "3rd",
+      "name": "DriverThree",
+      "time": "01:25.222"
+    }
+  ]
+}
