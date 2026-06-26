@@ -6,7 +6,7 @@
 // - STEWARD_TOKEN: Worker secret
 
 const SERVICE_NAME = "nuclear-family-league-server";
-const BACKEND_VERSION = "v1.0.1";
+const BACKEND_VERSION = "v1.0.2";
 
 const POINTS_BY_POSITION = {
   1: 25,
@@ -28,6 +28,7 @@ export default {
     if (request.method === "OPTIONS") return corsResponse(null, 204);
 
     if (request.method === "GET" && url.pathname === "/health") return handleHealth(env);
+    if (request.method === "GET" && url.pathname === "/admin/health") return handleAdminHealth(request, env);
     if (request.method === "POST" && url.pathname === "/ingest-race") return handleIngestRace(request, env);
     if (request.method === "GET" && url.pathname === "/standings") return handleStandings(env);
 
@@ -35,7 +36,18 @@ export default {
   }
 };
 
-async function handleHealth(env) {
+  async function handleHealth(env) {
+  async function handleAdminHealth(request, env) {
+  const authError = validateAdminAuthorization(request, env);
+  if (authError) return authError;
+
+  return jsonResponse({
+    ok: true,
+    role: "admin",
+    service: SERVICE_NAME,
+    version: BACKEND_VERSION
+  });
+}
   let databaseStatus = "unknown";
   try {
     await env.DB.prepare("SELECT 1 AS ok").first();
@@ -109,6 +121,23 @@ async function handleStandings(env) {
   return jsonResponse({ ok: true, standings: rows.results || [] });
 }
 
+function validateAdminAuthorization(request, env) {
+  if (!env.ADMIN_TOKEN) {
+    return jsonResponse({
+      ok: false,
+      error: "Server missing ADMIN_TOKEN secret"
+    }, 500);
+  }
+
+  const authHeader = request.headers.get("Authorization") || "";
+  const expected = "Bearer " + env.ADMIN_TOKEN;
+
+  if (authHeader !== expected) {
+    return jsonResponse({ ok: false, error: "Unauthorized admin" }, 401);
+  }
+
+  return null;
+}
 function validateAuthorization(request, env) {
   if (!env.STEWARD_TOKEN) return jsonResponse({ ok: false, error: "Server missing STEWARD_TOKEN secret" }, 500);
 
