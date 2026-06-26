@@ -1,24 +1,17 @@
 // Nuclear Family League Server
-// Backend Version: v1.0.1
+// Backend Version: v1.0.2
 //
 // Cloudflare bindings expected:
 // - DB: D1 database
 // - STEWARD_TOKEN: Worker secret
+// - ADMIN_TOKEN: Worker secret
 
 const SERVICE_NAME = "nuclear-family-league-server";
 const BACKEND_VERSION = "v1.0.2";
 
 const POINTS_BY_POSITION = {
-  1: 25,
-  2: 18,
-  3: 15,
-  4: 12,
-  5: 10,
-  6: 8,
-  7: 6,
-  8: 4,
-  9: 2,
-  10: 1
+  1: 25, 2: 18, 3: 15, 4: 12, 5: 10,
+  6: 8, 7: 6, 8: 4, 9: 2, 10: 1
 };
 
 export default {
@@ -36,18 +29,7 @@ export default {
   }
 };
 
-  async function handleHealth(env) {
-  async function handleAdminHealth(request, env) {
-  const authError = validateAdminAuthorization(request, env);
-  if (authError) return authError;
-
-  return jsonResponse({
-    ok: true,
-    role: "admin",
-    service: SERVICE_NAME,
-    version: BACKEND_VERSION
-  });
-}
+async function handleHealth(env) {
   let databaseStatus = "unknown";
   try {
     await env.DB.prepare("SELECT 1 AS ok").first();
@@ -62,6 +44,18 @@ export default {
     version: BACKEND_VERSION,
     database: databaseStatus,
     environment: "production"
+  });
+}
+
+async function handleAdminHealth(request, env) {
+  const authError = validateAdminAuthorization(request, env);
+  if (authError) return authError;
+
+  return jsonResponse({
+    ok: true,
+    role: "admin",
+    service: SERVICE_NAME,
+    version: BACKEND_VERSION
   });
 }
 
@@ -123,10 +117,7 @@ async function handleStandings(env) {
 
 function validateAdminAuthorization(request, env) {
   if (!env.ADMIN_TOKEN) {
-    return jsonResponse({
-      ok: false,
-      error: "Server missing ADMIN_TOKEN secret"
-    }, 500);
+    return jsonResponse({ ok: false, error: "Server missing ADMIN_TOKEN secret" }, 500);
   }
 
   const authHeader = request.headers.get("Authorization") || "";
@@ -138,6 +129,7 @@ function validateAdminAuthorization(request, env) {
 
   return null;
 }
+
 function validateAuthorization(request, env) {
   if (!env.STEWARD_TOKEN) return jsonResponse({ ok: false, error: "Server missing STEWARD_TOKEN secret" }, 500);
 
