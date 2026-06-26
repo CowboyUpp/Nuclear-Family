@@ -1,11 +1,12 @@
-// Nuclear Family Backend Worker
-// Version: v6.2-step1
+// Nuclear Family League Server
+// Backend Version: v1.0.1
 //
 // Cloudflare bindings expected:
 // - DB: D1 database
 // - STEWARD_TOKEN: Worker secret
 
-const SERVICE_NAME = "nuclear-family-backend";
+const SERVICE_NAME = "nuclear-family-league-server";
+const BACKEND_VERSION = "v1.0.1";
 
 const POINTS_BY_POSITION = {
   1: 25,
@@ -24,29 +25,33 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
-    if (request.method === "OPTIONS") {
-      return corsResponse(null, 204);
-    }
+    if (request.method === "OPTIONS") return corsResponse(null, 204);
 
-    if (request.method === "GET" && url.pathname === "/health") {
-      return jsonResponse({
-        ok: true,
-        service: SERVICE_NAME,
-        version: "v6.2-step1"
-      });
-    }
-
-    if (request.method === "POST" && url.pathname === "/ingest-race") {
-      return handleIngestRace(request, env);
-    }
-
-    if (request.method === "GET" && url.pathname === "/standings") {
-      return handleStandings(env);
-    }
+    if (request.method === "GET" && url.pathname === "/health") return handleHealth(env);
+    if (request.method === "POST" && url.pathname === "/ingest-race") return handleIngestRace(request, env);
+    if (request.method === "GET" && url.pathname === "/standings") return handleStandings(env);
 
     return jsonResponse({ ok: false, error: "Not found" }, 404);
   }
 };
+
+async function handleHealth(env) {
+  let databaseStatus = "unknown";
+  try {
+    await env.DB.prepare("SELECT 1 AS ok").first();
+    databaseStatus = "connected";
+  } catch (error) {
+    databaseStatus = "error";
+  }
+
+  return jsonResponse({
+    ok: true,
+    service: SERVICE_NAME,
+    version: BACKEND_VERSION,
+    database: databaseStatus,
+    environment: "production"
+  });
+}
 
 async function handleIngestRace(request, env) {
   const authError = validateAuthorization(request, env);
@@ -64,23 +69,12 @@ async function handleIngestRace(request, env) {
 
   const raceId = String(payload.race_id).trim();
 
-  const existing = await env.DB
-    .prepare("SELECT race_id FROM races WHERE race_id = ?")
-    .bind(raceId)
-    .first();
-
-  if (existing) {
-    return jsonResponse({
-      ok: false,
-      error: "Duplicate race_id",
-      race_id: raceId
-    }, 409);
-  }
+  const existing = await env.DB.prepare("SELECT race_id FROM races WHERE race_id = ?").bind(raceId).first();
+  if (existing) return jsonResponse({ ok: false, error: "Duplicate race_id", race_id: raceId }, 409);
 
   const receivedAt = new Date().toISOString();
 
-  await env.DB
-    .prepare("INSERT INTO races (race_id, scraped_at, received_at) VALUES (?, ?, ?)")
+  await env.DB.prepare("INSERT INTO races (race_id, scraped_at, received_at) VALUES (?, ?, ?)")
     .bind(raceId, payload.scraped_at, receivedAt)
     .run();
 
@@ -88,100 +82,54 @@ async function handleIngestRace(request, env) {
     const position = normalizePosition(result.position);
     const points = POINTS_BY_POSITION[position] || 0;
 
-    await env.DB
-      .prepare(
-        "INSERT INTO race_results (race_id, position, driver_name, race_time, points) VALUES (?, ?, ?, ?, ?)"
-      )
-      .bind(
-        raceId,
-        position,
-        String(result.name || "").trim(),
-        result.time ? String(result.time).trim() : null,
-        points
-      )
+    await env.DB.prepare("INSERT INTO race_results (race_id, position, driver_name, race_time, points) VALUES (?, ?, ?, ?, ?)")
+      .bind(raceId, position, String(result.name || "").trim(), result.time ? String(result.time).trim() : null, points)
       .run();
   }
 
-  return jsonResponse({
-    ok: true,
-    message: "Race ingested",
-    race_id: raceId,
-    results: payload.results.length
-  });
+  return jsonResponse({ ok: true, message: "Race ingested", race_id: raceId, results: payload.results.length });
 }
 
 async function handleStandings(env) {
-  const rows = await env.DB
-    .prepare(
-      `
-      SELECT
-        driver_name,
-        SUM(points) AS points,
-        COUNT(*) AS races,
-        SUM(CASE WHEN position = 1 THEN 1 ELSE 0 END) AS wins,
-        SUM(CASE WHEN position <= 3 THEN 1 ELSE 0 END) AS podiums
-      FROM race_results
-      GROUP BY driver_name
-      ORDER BY points DESC, wins DESC, podiums DESC, driver_name ASC
-      `
-    )
-    .all();
+  const rows = await env.DB.prepare(`
+    SELECT
+      driver_name,
+      NULL AS faction,
+      SUM(points) AS points,
+      COUNT(*) AS races,
+      SUM(CASE WHEN position = 1 THEN 1 ELSE 0 END) AS wins,
+      SUM(CASE WHEN position <= 3 THEN 1 ELSE 0 END) AS podiums,
+      MIN(position) AS best_finish,
+      ROUND(AVG(position), 2) AS avg_finish
+    FROM race_results
+    GROUP BY driver_name
+    ORDER BY points DESC, wins DESC, podiums DESC, avg_finish ASC, driver_name ASC
+  `).all();
 
-  return jsonResponse({
-    ok: true,
-    standings: rows.results || []
-  });
+  return jsonResponse({ ok: true, standings: rows.results || [] });
 }
 
 function validateAuthorization(request, env) {
-  if (!env.STEWARD_TOKEN) {
-    return jsonResponse({
-      ok: false,
-      error: "Server missing STEWARD_TOKEN secret"
-    }, 500);
-  }
+  if (!env.STEWARD_TOKEN) return jsonResponse({ ok: false, error: "Server missing STEWARD_TOKEN secret" }, 500);
 
   const authHeader = request.headers.get("Authorization") || "";
   const expected = "Bearer " + env.STEWARD_TOKEN;
 
-  if (authHeader !== expected) {
-    return jsonResponse({ ok: false, error: "Unauthorized" }, 401);
-  }
-
+  if (authHeader !== expected) return jsonResponse({ ok: false, error: "Unauthorized" }, 401);
   return null;
 }
 
 function validateRacePayload(payload) {
-  if (!payload || typeof payload !== "object") {
-    return jsonResponse({ ok: false, error: "Payload must be an object" }, 400);
-  }
-
-  if (!payload.race_id) {
-    return jsonResponse({ ok: false, error: "Missing race_id" }, 400);
-  }
-
-  if (!payload.scraped_at) {
-    return jsonResponse({ ok: false, error: "Missing scraped_at" }, 400);
-  }
-
-  if (!Array.isArray(payload.results)) {
-    return jsonResponse({ ok: false, error: "results must be an array" }, 400);
-  }
-
-  if (payload.results.length === 0) {
-    return jsonResponse({ ok: false, error: "results cannot be empty" }, 400);
-  }
+  if (!payload || typeof payload !== "object") return jsonResponse({ ok: false, error: "Payload must be an object" }, 400);
+  if (!payload.race_id) return jsonResponse({ ok: false, error: "Missing race_id" }, 400);
+  if (!payload.scraped_at) return jsonResponse({ ok: false, error: "Missing scraped_at" }, 400);
+  if (!Array.isArray(payload.results)) return jsonResponse({ ok: false, error: "results must be an array" }, 400);
+  if (payload.results.length === 0) return jsonResponse({ ok: false, error: "results cannot be empty" }, 400);
 
   for (const result of payload.results) {
     const position = normalizePosition(result.position);
-
-    if (!position || position < 1) {
-      return jsonResponse({ ok: false, error: "Invalid result position" }, 400);
-    }
-
-    if (!result.name || !String(result.name).trim()) {
-      return jsonResponse({ ok: false, error: "Missing driver name" }, 400);
-    }
+    if (!position || position < 1) return jsonResponse({ ok: false, error: "Invalid result position" }, 400);
+    if (!result.name || !String(result.name).trim()) return jsonResponse({ ok: false, error: "Missing driver name" }, 400);
   }
 
   return null;
@@ -189,19 +137,14 @@ function validateRacePayload(payload) {
 
 function normalizePosition(value) {
   if (typeof value === "number") return value;
-
   const text = String(value || "").trim();
   const match = text.match(/\d+/);
-
   if (!match) return 0;
-
   return Number(match[0]);
 }
 
 function jsonResponse(data, status = 200) {
-  return corsResponse(JSON.stringify(data, null, 2), status, {
-    "Content-Type": "application/json"
-  });
+  return corsResponse(JSON.stringify(data, null, 2), status, { "Content-Type": "application/json" });
 }
 
 function corsResponse(body, status = 200, extraHeaders = {}) {
