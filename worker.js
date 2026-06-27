@@ -1,5 +1,5 @@
 // Nuclear Family League Server
-// Backend Version: v1.0.8
+// Backend Version: v1.0.9
 //
 // Cloudflare bindings expected:
 // - DB: D1 database
@@ -7,7 +7,7 @@
 // - ADMIN_TOKEN: Worker secret
 
 const SERVICE_NAME = "nuclear-family-league-server";
-const BACKEND_VERSION = "v1.0.8";
+const BACKEND_VERSION = "v1.0.9";
 
 const POINTS_BY_POSITION = {
   1: 25, 2: 18, 3: 15, 4: 12, 5: 10,
@@ -443,7 +443,20 @@ async function handleIngestRace(request, env) {
   const raceId = String(payload.race_id).trim();
 
   const existing = await env.DB.prepare("SELECT race_id FROM races WHERE race_id = ?").bind(raceId).first();
-  if (existing) return jsonResponse({ ok: false, error: "Duplicate race_id", race_id: raceId }, 409);
+  if (existing) {
+    await writeAuditLog(env, authResult.steward || request.stewardActor || null, "race_duplicate", "race", raceId, {
+      fingerprint: payload.fingerprint || null,
+      auth_mode: authResult.mode
+    });
+    return jsonResponse({
+      ok: false,
+      duplicate: true,
+      error: "Duplicate race_id",
+      race_id: raceId,
+      fingerprint: existing.fingerprint || null,
+      version: BACKEND_VERSION
+    }, 409);
+  }
 
   const receivedAt = new Date().toISOString();
 
@@ -460,11 +473,19 @@ async function handleIngestRace(request, env) {
       .run();
   }
 
+  await writeAuditLog(env, authResult.steward || request.stewardActor || null, "race_ingest", "race", raceId, {
+    results: payload.results.length,
+    fingerprint: payload.fingerprint || null,
+    auth_mode: authResult.mode
+  });
+
   return jsonResponse({
     ok: true,
     message: "Race ingested",
     race_id: raceId,
     results: payload.results.length,
+    fingerprint: payload.fingerprint || null,
+    version: BACKEND_VERSION,
     steward: authResult.steward ? {
       id: authResult.steward.id,
       display_name: authResult.steward.display_name,
@@ -690,8 +711,12 @@ async function validateAdminAuthorization(request, env) {
 async function validateUploadAuthorization(request, env) {
   const authHeader = request.headers.get("Authorization") || "";
   const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : "";
-  if (!token) return jsonResponse({ ok: false, error: "Unauthorized" }, 401);
 
+  if (!token) {
+    return { errorResponse: jsonResponse({ ok: false, error: "Unauthorized" }, 401), steward: null, mode: "missing" };
+  }
+
+  // Preferred path: personal steward session token.
   try {
     const tokenHash = await sha256Hex(token);
     const row = await env.DB.prepare(`
@@ -703,22 +728,38 @@ async function validateUploadAuthorization(request, env) {
     `).bind(tokenHash, new Date().toISOString()).first();
 
     if (row) {
-      if (Number(row.active) !== 1) return jsonResponse({ ok: false, error: "Steward disabled" }, 403);
+      if (Number(row.active) !== 1) {
+        return { errorResponse: jsonResponse({ ok: false, error: "Steward disabled" }, 403), steward: row, mode: "session" };
+      }
+
       const role = String(row.role || "");
-      if (!["super_admin", "admin", "chief", "event"].includes(role)) return jsonResponse({ ok: false, error: "Insufficient upload role" }, 403);
+      if (!["super_admin", "admin", "chief", "event"].includes(role)) {
+        return { errorResponse: jsonResponse({ ok: false, error: "Insufficient upload role" }, 403), steward: row, mode: "session" };
+      }
+
       request.stewardActor = row;
-      return null;
+      return { errorResponse: null, steward: row, mode: "session" };
     }
   } catch (error) {
-    return jsonResponse({ ok: false, error: "Upload session validation failed" }, 500);
+    return {
+      errorResponse: jsonResponse({
+        ok: false,
+        error: "Upload session validation failed",
+        detail: String(error && error.message ? error.message : error)
+      }, 500),
+      steward: null,
+      mode: "session_error"
+    };
   }
 
+  // Temporary migration fallback: legacy shared STEWARD_TOKEN.
   if (env.STEWARD_TOKEN && token === env.STEWARD_TOKEN) {
-    request.stewardActor = { id: null, torn_id: "legacy", display_name: "Legacy Steward Token", role: "legacy" };
-    return null;
+    const legacy = { id: null, torn_id: "legacy", display_name: "Legacy Steward Token", role: "legacy" };
+    request.stewardActor = legacy;
+    return { errorResponse: null, steward: legacy, mode: "legacy" };
   }
 
-  return jsonResponse({ ok: false, error: "Unauthorized" }, 401);
+  return { errorResponse: jsonResponse({ ok: false, error: "Unauthorized" }, 401), steward: null, mode: "invalid" };
 }
 
 function validateRacePayload(payload) {
