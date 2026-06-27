@@ -1,5 +1,5 @@
 // Nuclear Family League Server
-// Backend Version: v1.0.4
+// Backend Version: v1.0.5
 //
 // Cloudflare bindings expected:
 // - DB: D1 database
@@ -7,7 +7,7 @@
 // - ADMIN_TOKEN: Worker secret
 
 const SERVICE_NAME = "nuclear-family-league-server";
-const BACKEND_VERSION = "v1.0.4";
+const BACKEND_VERSION = "v1.0.5";
 
 const POINTS_BY_POSITION = {
   1: 25, 2: 18, 3: 15, 4: 12, 5: 10,
@@ -23,6 +23,7 @@ export default {
     if (request.method === "GET" && url.pathname === "/health") return handleHealth(env);
     if (request.method === "GET" && url.pathname === "/admin/health") return handleAdminHealth(request, env);
     if (request.method === "GET" && url.pathname === "/admin/config-check") return handleAdminConfigCheck(request, env);
+    if (request.method === "POST" && url.pathname === "/auth/login") return handleStewardLogin(request, env);
     if (request.method === "GET" && url.pathname === "/admin/stewards") return handleAdminListStewards(request, env);
     if (request.method === "POST" && url.pathname === "/admin/stewards") return handleAdminCreateSteward(request, env);
 
@@ -51,7 +52,7 @@ async function handleHealth(env) {
 }
 
 async function handleAdminHealth(request, env) {
-  const authError = validateAdminAuthorization(request, env);
+  const authError = await validateAdminAuthorization(request, env);
   if (authError) return authError;
 
   return jsonResponse({
@@ -63,7 +64,7 @@ async function handleAdminHealth(request, env) {
 }
 
 async function handleAdminConfigCheck(request, env) {
-  const authError = validateAdminAuthorization(request, env);
+  const authError = await validateAdminAuthorization(request, env);
   if (authError) return authError;
 
   const checks = await runConfigChecks(env, true);
@@ -99,7 +100,7 @@ async function runConfigChecks(env, includeTables) {
   }
 
   if (includeTables && checks.db.status === "connected") {
-    const tableNames = ["races", "race_results", "stewards"];
+    const tableNames = ["races", "race_results", "stewards", "steward_sessions"];
     for (const tableName of tableNames) {
       try {
         await env.DB.prepare(`SELECT COUNT(*) AS count FROM ${tableName}`).first();
@@ -118,7 +119,7 @@ async function runConfigChecks(env, includeTables) {
 }
 
 async function handleAdminListStewards(request, env) {
-  const authError = validateAdminAuthorization(request, env);
+  const authError = await validateAdminAuthorization(request, env);
   if (authError) return authError;
 
   try {
@@ -151,7 +152,7 @@ async function handleAdminListStewards(request, env) {
 }
 
 async function handleAdminCreateSteward(request, env) {
-  const authError = validateAdminAuthorization(request, env);
+  const authError = await validateAdminAuthorization(request, env);
   if (authError) return authError;
 
   let payload;
@@ -207,6 +208,70 @@ async function handleAdminCreateSteward(request, env) {
 }
 
 
+async function handleStewardLogin(request, env) {
+  let payload;
+  try {
+    payload = await request.json();
+  } catch (error) {
+    return jsonResponse({ ok: false, error: "Invalid JSON body" }, 400);
+  }
+
+  const tornId = sanitizeText(payload.torn_id, 24);
+  const token = String(payload.token || "").trim();
+
+  if (!tornId || !/^\d{1,12}$/.test(tornId)) return jsonResponse({ ok: false, error: "torn_id must be numeric" }, 400);
+  if (!token) return jsonResponse({ ok: false, error: "token is required" }, 400);
+
+  try {
+    const tokenHash = await sha256Hex(token);
+    const steward = await env.DB.prepare(`
+      SELECT id, torn_id, display_name, role, active, created_at, last_seen_at, script_version, notes
+      FROM stewards
+      WHERE torn_id = ? AND token_hash = ?
+      LIMIT 1
+    `).bind(tornId, tokenHash).first();
+
+    if (!steward) return jsonResponse({ ok: false, error: "Invalid Torn ID or token" }, 401);
+    if (Number(steward.active) !== 1) return jsonResponse({ ok: false, error: "Steward disabled" }, 403);
+
+    const rawSession = generateToken("nf_session");
+    const sessionHash = await sha256Hex(rawSession);
+    const now = new Date();
+    const expires = new Date(now.getTime() + 12 * 60 * 60 * 1000).toISOString();
+
+    await env.DB.prepare(`
+      INSERT INTO steward_sessions (steward_id, session_hash, created_at, expires_at)
+      VALUES (?, ?, ?, ?)
+    `).bind(steward.id, sessionHash, now.toISOString(), expires).run();
+
+    await env.DB.prepare("UPDATE stewards SET last_seen_at = ? WHERE id = ?")
+      .bind(now.toISOString(), steward.id)
+      .run();
+
+    return jsonResponse({
+      ok: true,
+      session_token: rawSession,
+      expires_at: expires,
+      steward: {
+        id: steward.id,
+        torn_id: steward.torn_id,
+        display_name: steward.display_name,
+        role: steward.role,
+        active: steward.active
+      },
+      permissions: {
+        steward_admin: steward.role === "super_admin" || steward.role === "admin"
+      }
+    });
+  } catch (error) {
+    return jsonResponse({
+      ok: false,
+      error: "Login failed",
+      detail: String(error && error.message ? error.message : error)
+    }, 500);
+  }
+}
+
 function parseStewardAction(pathname) {
   const match = pathname.match(/^\/admin\/stewards\/(\d+)(?:\/([a-z-]+))?$/);
   if (!match) return null;
@@ -218,7 +283,7 @@ function parseStewardAction(pathname) {
 }
 
 async function handleAdminUpdateSteward(request, env, stewardId) {
-  const authError = validateAdminAuthorization(request, env);
+  const authError = await validateAdminAuthorization(request, env);
   if (authError) return authError;
 
   if (!stewardId || stewardId < 1) return jsonResponse({ ok: false, error: "Invalid steward id" }, 400);
@@ -255,7 +320,7 @@ async function handleAdminUpdateSteward(request, env, stewardId) {
 }
 
 async function handleAdminSetStewardActive(request, env, stewardId, active) {
-  const authError = validateAdminAuthorization(request, env);
+  const authError = await validateAdminAuthorization(request, env);
   if (authError) return authError;
 
   if (!stewardId || stewardId < 1) return jsonResponse({ ok: false, error: "Invalid steward id" }, 400);
@@ -275,7 +340,7 @@ async function handleAdminSetStewardActive(request, env, stewardId, active) {
 }
 
 async function handleAdminRegenerateStewardToken(request, env, stewardId) {
-  const authError = validateAdminAuthorization(request, env);
+  const authError = await validateAdminAuthorization(request, env);
   if (authError) return authError;
 
   if (!stewardId || stewardId < 1) return jsonResponse({ ok: false, error: "Invalid steward id" }, 400);
@@ -368,15 +433,58 @@ async function handleStandings(env) {
   return jsonResponse({ ok: true, standings: rows.results || [] });
 }
 
-function validateAdminAuthorization(request, env) {
+async function validateAdminAuthorization(request, env) {
   if (!env.ADMIN_TOKEN) return jsonResponse({ ok: false, error: "Server missing ADMIN_TOKEN secret" }, 500);
 
   const authHeader = request.headers.get("Authorization") || "";
-  const expected = "Bearer " + env.ADMIN_TOKEN;
+  const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : "";
 
-  if (authHeader !== expected) return jsonResponse({ ok: false, error: "Unauthorized admin" }, 401);
-  return null;
+  if (!token) return jsonResponse({ ok: false, error: "Unauthorized admin" }, 401);
+
+  if (token === env.ADMIN_TOKEN) return null;
+
+  try {
+    const tokenHash = await sha256Hex(token);
+    const row = await env.DB.prepare(`
+      SELECT
+        ss.id AS session_id,
+        ss.expires_at,
+        s.id AS steward_id,
+        s.torn_id,
+        s.display_name,
+        s.role,
+        s.active
+      FROM steward_sessions ss
+      JOIN stewards s ON s.id = ss.steward_id
+      WHERE ss.session_hash = ?
+      LIMIT 1
+    `).bind(tokenHash).first();
+
+    if (!row) return jsonResponse({ ok: false, error: "Unauthorized admin" }, 401);
+    if (Number(row.active) !== 1) return jsonResponse({ ok: false, error: "Steward disabled" }, 403);
+
+    const now = new Date();
+    const expires = new Date(row.expires_at);
+    if (!row.expires_at || expires <= now) return jsonResponse({ ok: false, error: "Session expired" }, 401);
+
+    const role = String(row.role || "");
+    if (role !== "super_admin" && role !== "admin") return jsonResponse({ ok: false, error: "Insufficient role" }, 403);
+
+    await env.DB.prepare("UPDATE stewards SET last_seen_at = ? WHERE id = ?")
+      .bind(now.toISOString(), row.steward_id)
+      .run();
+
+    return null;
+  } catch (error) {
+    return jsonResponse({
+      ok: false,
+      error: "Admin session validation failed",
+      detail: String(error && error.message ? error.message : error)
+    }, 500);
+  }
 }
+
+
 
 async function validateUploadAuthorization(request, env) {
   if (!env.STEWARD_TOKEN) {
