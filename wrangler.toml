@@ -1,4 +1,4 @@
-name = "nuclear-family-backend"
+name = "nuclear-family"
 main = "worker.js"
 compatibility_date = "2026-06-24"
 
