@@ -1,5 +1,5 @@
 // Nuclear Family League Server
-// Backend Version: v1.0.6
+// Backend Version: v1.0.7
 //
 // Cloudflare bindings expected:
 // - DB: D1 database
@@ -7,7 +7,7 @@
 // - ADMIN_TOKEN: Worker secret
 
 const SERVICE_NAME = "nuclear-family-league-server";
-const BACKEND_VERSION = "v1.0.6";
+const BACKEND_VERSION = "v1.0.7";
 
 const POINTS_BY_POSITION = {
   1: 25, 2: 18, 3: 15, 4: 12, 5: 10,
@@ -34,6 +34,7 @@ export default {
     if (stewardAction && request.method === "POST" && stewardAction.action === "regenerate-token") return handleAdminRegenerateStewardToken(request, env, stewardAction.id);
     if (request.method === "POST" && url.pathname === "/ingest-race") return handleIngestRace(request, env);
     if (request.method === "GET" && url.pathname === "/standings") return handleStandings(env);
+    if (request.method === "GET" && url.pathname === "/race-status") return handleRaceStatus(request, env);
 
     return jsonResponse({ ok: false, error: "Not found" }, 404);
   }
@@ -439,8 +440,8 @@ async function handleIngestRace(request, env) {
 
   const receivedAt = new Date().toISOString();
 
-  await env.DB.prepare("INSERT INTO races (race_id, scraped_at, received_at) VALUES (?, ?, ?)")
-    .bind(raceId, payload.scraped_at, receivedAt)
+  await env.DB.prepare("INSERT INTO races (race_id, scraped_at, received_at, fingerprint) VALUES (?, ?, ?, ?)")
+    .bind(raceId, payload.scraped_at, receivedAt, payload.fingerprint || null)
     .run();
 
   for (const result of payload.results) {
@@ -463,6 +464,37 @@ async function handleIngestRace(request, env) {
       role: authResult.steward.role
     } : null,
     auth_mode: authResult.mode
+  });
+}
+
+async function handleRaceStatus(request, env) {
+  const url = new URL(request.url);
+  const raceId = String(url.searchParams.get("race_id") || "").trim();
+
+  if (!raceId) return jsonResponse({ ok: false, error: "Missing race_id" }, 400);
+
+  const race = await env.DB.prepare(`
+    SELECT race_id, scraped_at, received_at, fingerprint
+    FROM races
+    WHERE race_id = ?
+  `).bind(raceId).first();
+
+  if (!race) return jsonResponse({ ok: true, exists: false, race_id: raceId });
+
+  const count = await env.DB.prepare(`
+    SELECT COUNT(*) AS result_count
+    FROM race_results
+    WHERE race_id = ?
+  `).bind(raceId).first();
+
+  return jsonResponse({
+    ok: true,
+    exists: true,
+    race_id: raceId,
+    fingerprint: race.fingerprint || null,
+    scraped_at: race.scraped_at || null,
+    received_at: race.received_at || null,
+    result_count: count && count.result_count ? count.result_count : 0
   });
 }
 
