@@ -1,5 +1,5 @@
 // Nuclear Family League Server
-// Backend Version: v1.0.7
+// Backend Version: v1.0.8
 //
 // Cloudflare bindings expected:
 // - DB: D1 database
@@ -7,7 +7,7 @@
 // - ADMIN_TOKEN: Worker secret
 
 const SERVICE_NAME = "nuclear-family-league-server";
-const BACKEND_VERSION = "v1.0.7";
+const BACKEND_VERSION = "v1.0.8";
 
 const POINTS_BY_POSITION = {
   1: 25, 2: 18, 3: 15, 4: 12, 5: 10,
@@ -35,6 +35,13 @@ export default {
     if (request.method === "POST" && url.pathname === "/ingest-race") return handleIngestRace(request, env);
     if (request.method === "GET" && url.pathname === "/standings") return handleStandings(env);
     if (request.method === "GET" && url.pathname === "/race-status") return handleRaceStatus(request, env);
+    if (request.method === "GET" && url.pathname === "/championship/seasons") return handleListSeasons(request, env);
+    if (request.method === "POST" && url.pathname === "/championship/seasons") return handleCreateSeason(request, env);
+    if (request.method === "GET" && url.pathname === "/championship/events") return handleListEvents(request, env);
+    if (request.method === "POST" && url.pathname === "/championship/events") return handleCreateEvent(request, env);
+    if (request.method === "GET" && url.pathname === "/championship/unassigned-races") return handleUnassignedRaces(request, env);
+    if (request.method === "POST" && url.pathname === "/championship/assign-race") return handleAssignRaceToEvent(request, env);
+    if (request.method === "GET" && url.pathname === "/championship/standings") return handleChampionshipStandings(request, env);
 
     return jsonResponse({ ok: false, error: "Not found" }, 404);
   }
@@ -102,7 +109,7 @@ async function runConfigChecks(env, includeTables) {
   }
 
   if (includeTables && checks.db.status === "connected") {
-    const tableNames = ["races", "race_results", "stewards", "steward_sessions", "audit_log"];
+    const tableNames = ["races", "race_results", "stewards", "steward_sessions", "audit_log", "seasons", "events", "event_races"];
     for (const tableName of tableNames) {
       try {
         await env.DB.prepare(`SELECT COUNT(*) AS count FROM ${tableName}`).first();
@@ -465,6 +472,116 @@ async function handleIngestRace(request, env) {
     } : null,
     auth_mode: authResult.mode
   });
+}
+
+
+async function requireChampionshipAdmin(request, env) {
+  const authError = await validateAdminAuthorization(request, env);
+  if (authError) return { error: authError, actor: null };
+  const actor = await resolveActorFromAuthorization(request, env);
+  const role = actor && actor.role ? String(actor.role) : "bootstrap";
+  if (!["bootstrap","super_admin","admin","chief"].includes(role)) {
+    return { error: jsonResponse({ ok:false, error:"Insufficient championship role" }, 403), actor };
+  }
+  return { error:null, actor };
+}
+
+async function handleListSeasons(request, env) {
+  const rows = await env.DB.prepare("SELECT id,name,year,status,scoring_type,created_at,archived_at FROM seasons ORDER BY year DESC,id DESC").all();
+  return jsonResponse({ ok:true, seasons: rows.results || [] });
+}
+
+async function handleCreateSeason(request, env) {
+  const auth = await requireChampionshipAdmin(request, env);
+  if (auth.error) return auth.error;
+  let payload; try { payload = await request.json(); } catch(e) { return jsonResponse({ok:false,error:"Invalid JSON body"},400); }
+  const name = sanitizeText(payload.name,80);
+  const year = Number(payload.year || new Date().getUTCFullYear());
+  const scoringType = sanitizeText(payload.scoring_type || "standard",30);
+  if (!name) return jsonResponse({ok:false,error:"Season name required"},400);
+  if (!year || year < 2020 || year > 2100) return jsonResponse({ok:false,error:"Invalid season year"},400);
+  const now = new Date().toISOString();
+  await env.DB.prepare("INSERT INTO seasons (name,year,status,scoring_type,created_at) VALUES (?,?,'active',?,?)").bind(name,year,scoringType,now).run();
+  const season = await env.DB.prepare("SELECT id,name,year,status,scoring_type,created_at FROM seasons ORDER BY id DESC LIMIT 1").first();
+  await writeAuditLog(env, auth.actor, "season_create", "season", season.id, {name,year,scoring_type:scoringType});
+  return jsonResponse({ok:true, season});
+}
+
+async function handleListEvents(request, env) {
+  const url = new URL(request.url);
+  const seasonId = url.searchParams.get("season_id");
+  const sql = seasonId ? `
+    SELECT e.id,e.season_id,s.name AS season_name,e.name,e.track,e.status,e.round_number,e.created_at,e.locked_at,COUNT(er.race_id) AS race_count
+    FROM events e JOIN seasons s ON s.id=e.season_id LEFT JOIN event_races er ON er.event_id=e.id
+    WHERE e.season_id=? GROUP BY e.id ORDER BY e.round_number ASC,e.id ASC` : `
+    SELECT e.id,e.season_id,s.name AS season_name,e.name,e.track,e.status,e.round_number,e.created_at,e.locked_at,COUNT(er.race_id) AS race_count
+    FROM events e JOIN seasons s ON s.id=e.season_id LEFT JOIN event_races er ON er.event_id=e.id
+    GROUP BY e.id ORDER BY s.year DESC,e.round_number ASC,e.id ASC`;
+  const rows = seasonId ? await env.DB.prepare(sql).bind(Number(seasonId)).all() : await env.DB.prepare(sql).all();
+  return jsonResponse({ok:true, events: rows.results || []});
+}
+
+async function handleCreateEvent(request, env) {
+  const auth = await requireChampionshipAdmin(request, env);
+  if (auth.error) return auth.error;
+  let payload; try { payload = await request.json(); } catch(e) { return jsonResponse({ok:false,error:"Invalid JSON body"},400); }
+  const seasonId = Number(payload.season_id);
+  const name = sanitizeText(payload.name,80);
+  const track = sanitizeText(payload.track || "",40);
+  const roundNumber = Number(payload.round_number || 1);
+  if (!seasonId || !name) return jsonResponse({ok:false,error:"season_id and name required"},400);
+  const season = await env.DB.prepare("SELECT id FROM seasons WHERE id=?").bind(seasonId).first();
+  if (!season) return jsonResponse({ok:false,error:"Season not found"},404);
+  const now = new Date().toISOString();
+  await env.DB.prepare("INSERT INTO events (season_id,name,track,status,round_number,created_at) VALUES (?,?,?,'open',?,?)").bind(seasonId,name,track,roundNumber,now).run();
+  const event = await env.DB.prepare("SELECT id,season_id,name,track,status,round_number,created_at FROM events ORDER BY id DESC LIMIT 1").first();
+  await writeAuditLog(env, auth.actor, "event_create", "event", event.id, {season_id:seasonId,name,track,round_number:roundNumber});
+  return jsonResponse({ok:true,event});
+}
+
+async function handleUnassignedRaces(request, env) {
+  const rows = await env.DB.prepare(`
+    SELECT r.race_id,r.received_at,r.fingerprint,COUNT(rr.race_id) AS result_count
+    FROM races r LEFT JOIN event_races er ON er.race_id=r.race_id LEFT JOIN race_results rr ON rr.race_id=r.race_id
+    WHERE er.race_id IS NULL GROUP BY r.race_id ORDER BY r.received_at DESC LIMIT 50`).all();
+  return jsonResponse({ok:true, races: rows.results || []});
+}
+
+async function handleAssignRaceToEvent(request, env) {
+  const auth = await requireChampionshipAdmin(request, env);
+  if (auth.error) return auth.error;
+  let payload; try { payload = await request.json(); } catch(e) { return jsonResponse({ok:false,error:"Invalid JSON body"},400); }
+  const raceId = sanitizeText(payload.race_id,40);
+  const eventId = Number(payload.event_id);
+  if (!raceId || !eventId) return jsonResponse({ok:false,error:"race_id and event_id required"},400);
+  const race = await env.DB.prepare("SELECT race_id FROM races WHERE race_id=?").bind(raceId).first();
+  if (!race) return jsonResponse({ok:false,error:"Race not found"},404);
+  const event = await env.DB.prepare("SELECT id,status FROM events WHERE id=?").bind(eventId).first();
+  if (!event) return jsonResponse({ok:false,error:"Event not found"},404);
+  if (event.status === "locked") return jsonResponse({ok:false,error:"Event is locked"},409);
+  const now = new Date().toISOString();
+  await env.DB.prepare("INSERT OR REPLACE INTO event_races (event_id,race_id,assigned_at,assigned_by) VALUES (?,?,?,?)").bind(eventId,raceId,now,auth.actor && auth.actor.id ? auth.actor.id : null).run();
+  await writeAuditLog(env, auth.actor, "race_assign", "race", raceId, {event_id:eventId});
+  return jsonResponse({ok:true,event_id:eventId,race_id:raceId});
+}
+
+async function handleChampionshipStandings(request, env) {
+  const url = new URL(request.url);
+  let seasonId = Number(url.searchParams.get("season_id") || 0);
+  if (!seasonId) {
+    const active = await env.DB.prepare("SELECT id FROM seasons WHERE status='active' ORDER BY year DESC,id DESC LIMIT 1").first();
+    if (active) seasonId = active.id;
+  }
+  if (!seasonId) return jsonResponse({ok:true,season_id:null,standings:[]});
+  const rows = await env.DB.prepare(`
+    SELECT rr.driver_name,NULL AS faction,SUM(rr.points) AS points,COUNT(*) AS races,
+      SUM(CASE WHEN rr.position=1 THEN 1 ELSE 0 END) AS wins,
+      SUM(CASE WHEN rr.position<=3 THEN 1 ELSE 0 END) AS podiums,
+      MIN(rr.position) AS best_finish,ROUND(AVG(rr.position),2) AS avg_finish
+    FROM race_results rr JOIN event_races er ON er.race_id=rr.race_id JOIN events e ON e.id=er.event_id
+    WHERE e.season_id=? GROUP BY rr.driver_name
+    ORDER BY points DESC,wins DESC,podiums DESC,avg_finish ASC,driver_name ASC`).bind(seasonId).all();
+  return jsonResponse({ok:true,season_id:seasonId,standings:rows.results || []});
 }
 
 async function handleRaceStatus(request, env) {
