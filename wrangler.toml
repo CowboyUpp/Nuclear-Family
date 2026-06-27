@@ -2,6 +2,10 @@ name = "nuclear-family-backend"
 main = "worker.js"
 compatibility_date = "2026-06-24"
 
+[[d1_databases]]
+binding = "DB"
+database_name = "nuclear-family-db"
+database_id = "YOUR_REAL_DATABASE_ID"
 # After creating a D1 database, add the real database_id here.
 # [[d1_databases]]
 # binding = "DB"
