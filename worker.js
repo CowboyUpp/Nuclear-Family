@@ -1,5 +1,5 @@
 // Nuclear Family League Server
-// Backend Version: v1.0.5
+// Backend Version: v1.0.6
 //
 // Cloudflare bindings expected:
 // - DB: D1 database
@@ -7,7 +7,7 @@
 // - ADMIN_TOKEN: Worker secret
 
 const SERVICE_NAME = "nuclear-family-league-server";
-const BACKEND_VERSION = "v1.0.5";
+const BACKEND_VERSION = "v1.0.6";
 
 const POINTS_BY_POSITION = {
   1: 25, 2: 18, 3: 15, 4: 12, 5: 10,
@@ -54,6 +54,7 @@ async function handleHealth(env) {
 async function handleAdminHealth(request, env) {
   const authError = await validateAdminAuthorization(request, env);
   if (authError) return authError;
+  const actorForAudit = await resolveActorFromAuthorization(request, env);
 
   return jsonResponse({
     ok: true,
@@ -100,7 +101,7 @@ async function runConfigChecks(env, includeTables) {
   }
 
   if (includeTables && checks.db.status === "connected") {
-    const tableNames = ["races", "race_results", "stewards", "steward_sessions"];
+    const tableNames = ["races", "race_results", "stewards", "steward_sessions", "audit_log"];
     for (const tableName of tableNames) {
       try {
         await env.DB.prepare(`SELECT COUNT(*) AS count FROM ${tableName}`).first();
@@ -208,6 +209,47 @@ async function handleAdminCreateSteward(request, env) {
 }
 
 
+
+async function writeAuditLog(env, actor, action, targetType, targetId, details) {
+  try {
+    await env.DB.prepare(`
+      INSERT INTO audit_log (created_at, actor_id, actor_torn_id, actor_name, actor_role, action, target_type, target_id, details)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).bind(
+      new Date().toISOString(),
+      actor && actor.id ? actor.id : null,
+      actor && actor.torn_id ? actor.torn_id : null,
+      actor && actor.display_name ? actor.display_name : null,
+      actor && actor.role ? actor.role : null,
+      action || "",
+      targetType || null,
+      targetId !== undefined && targetId !== null ? String(targetId) : null,
+      details ? JSON.stringify(details).slice(0, 2000) : null
+    ).run();
+  } catch (error) {
+    console.warn("Audit log write failed:", error && error.message ? error.message : error);
+  }
+}
+
+async function resolveActorFromAuthorization(request, env) {
+  const authHeader = request.headers.get("Authorization") || "";
+  const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : "";
+  if (!token) return null;
+  if (env.ADMIN_TOKEN && token === env.ADMIN_TOKEN) return { id: null, torn_id: "bootstrap", display_name: "Emergency Bootstrap", role: "bootstrap" };
+  try {
+    const tokenHash = await sha256Hex(token);
+    return await env.DB.prepare(`
+      SELECT s.id, s.torn_id, s.display_name, s.role, s.active
+      FROM steward_sessions ss
+      JOIN stewards s ON s.id = ss.steward_id
+      WHERE ss.session_hash = ? AND ss.expires_at > ?
+      LIMIT 1
+    `).bind(tokenHash, new Date().toISOString()).first();
+  } catch (error) {
+    return null;
+  }
+}
+
 async function handleStewardLogin(request, env) {
   let payload;
   try {
@@ -247,6 +289,8 @@ async function handleStewardLogin(request, env) {
     await env.DB.prepare("UPDATE stewards SET last_seen_at = ? WHERE id = ?")
       .bind(now.toISOString(), steward.id)
       .run();
+
+    await writeAuditLog(env, steward, "login", "steward", steward.id, { expires_at: expires });
 
     return jsonResponse({
       ok: true,
@@ -316,12 +360,17 @@ async function handleAdminUpdateSteward(request, env, stewardId) {
     WHERE id = ?
   `).bind(stewardId).first();
 
+  await writeAuditLog(env, actorForAudit, "steward_update", "steward", stewardId, { display_name: displayName, role: role });
+
+  await writeAuditLog(env, actorForAudit, "steward_active_change", "steward", stewardId, { active: active });
+
   return jsonResponse({ ok: true, steward: updated });
 }
 
 async function handleAdminSetStewardActive(request, env, stewardId, active) {
   const authError = await validateAdminAuthorization(request, env);
   if (authError) return authError;
+  const actorForAudit = await resolveActorFromAuthorization(request, env);
 
   if (!stewardId || stewardId < 1) return jsonResponse({ ok: false, error: "Invalid steward id" }, 400);
 
@@ -342,6 +391,7 @@ async function handleAdminSetStewardActive(request, env, stewardId, active) {
 async function handleAdminRegenerateStewardToken(request, env, stewardId) {
   const authError = await validateAdminAuthorization(request, env);
   if (authError) return authError;
+  const actorForAudit = await resolveActorFromAuthorization(request, env);
 
   if (!stewardId || stewardId < 1) return jsonResponse({ ok: false, error: "Invalid steward id" }, 400);
 
@@ -357,6 +407,8 @@ async function handleAdminRegenerateStewardToken(request, env, stewardId) {
   const tokenHash = await sha256Hex(rawToken);
 
   await env.DB.prepare("UPDATE stewards SET token_hash = ? WHERE id = ?").bind(tokenHash, stewardId).run();
+
+  await writeAuditLog(env, actorForAudit, "steward_token_regenerate", "steward", stewardId, {});
 
   return jsonResponse({
     ok: true,
@@ -487,46 +539,37 @@ async function validateAdminAuthorization(request, env) {
 
 
 async function validateUploadAuthorization(request, env) {
-  if (!env.STEWARD_TOKEN) {
-    return { errorResponse: jsonResponse({ ok: false, error: "Server missing STEWARD_TOKEN secret" }, 500) };
-  }
-
   const authHeader = request.headers.get("Authorization") || "";
   const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : "";
+  if (!token) return jsonResponse({ ok: false, error: "Unauthorized" }, 401);
 
-  if (!token) {
-    return { errorResponse: jsonResponse({ ok: false, error: "Unauthorized" }, 401) };
-  }
-
-  // Backward-compatible temporary shared token.
-  if (token === env.STEWARD_TOKEN) {
-    return { mode: "shared_steward_token", steward: null };
-  }
-
-  // New registry token support. Tokens are stored only as SHA-256 hashes.
   try {
     const tokenHash = await sha256Hex(token);
     const row = await env.DB.prepare(`
-      SELECT id, torn_id, display_name, role, active
-      FROM stewards
-      WHERE token_hash = ?
+      SELECT s.id, s.torn_id, s.display_name, s.role, s.active
+      FROM steward_sessions ss
+      JOIN stewards s ON s.id = ss.steward_id
+      WHERE ss.session_hash = ? AND ss.expires_at > ?
       LIMIT 1
-    `).bind(tokenHash).first();
+    `).bind(tokenHash, new Date().toISOString()).first();
 
-    if (row && Number(row.active) === 1) {
-      await env.DB.prepare(`
-        UPDATE stewards
-        SET last_seen_at = ?, script_version = COALESCE(script_version, NULL)
-        WHERE id = ?
-      `).bind(new Date().toISOString(), row.id).run();
-
-      return { mode: "registry_token", steward: row };
+    if (row) {
+      if (Number(row.active) !== 1) return jsonResponse({ ok: false, error: "Steward disabled" }, 403);
+      const role = String(row.role || "");
+      if (!["super_admin", "admin", "chief", "event"].includes(role)) return jsonResponse({ ok: false, error: "Insufficient upload role" }, 403);
+      request.stewardActor = row;
+      return null;
     }
   } catch (error) {
-    // If registry table is missing, shared token mode still works.
+    return jsonResponse({ ok: false, error: "Upload session validation failed" }, 500);
   }
 
-  return { errorResponse: jsonResponse({ ok: false, error: "Unauthorized" }, 401) };
+  if (env.STEWARD_TOKEN && token === env.STEWARD_TOKEN) {
+    request.stewardActor = { id: null, torn_id: "legacy", display_name: "Legacy Steward Token", role: "legacy" };
+    return null;
+  }
+
+  return jsonResponse({ ok: false, error: "Unauthorized" }, 401);
 }
 
 function validateRacePayload(payload) {
