@@ -1,5 +1,5 @@
 // Nuclear Family League Server
-// Backend Version: v1.0.9
+// Backend Version: v1.0.11
 //
 // Cloudflare bindings expected:
 // - DB: D1 database
@@ -7,7 +7,7 @@
 // - ADMIN_TOKEN: Worker secret
 
 const SERVICE_NAME = "nuclear-family-league-server";
-const BACKEND_VERSION = "v1.0.9";
+const BACKEND_VERSION = "v1.0.11";
 
 const POINTS_BY_POSITION = {
   1: 25, 2: 18, 3: 15, 4: 12, 5: 10,
@@ -427,72 +427,81 @@ async function handleAdminRegenerateStewardToken(request, env, stewardId) {
 }
 
 async function handleIngestRace(request, env) {
-  const authResult = await validateUploadAuthorization(request, env);
-  if (authResult.errorResponse) return authResult.errorResponse;
-
-  let payload;
   try {
-    payload = await request.json();
-  } catch (error) {
-    return jsonResponse({ ok: false, error: "Invalid JSON body" }, 400);
-  }
+    const authResult = await validateUploadAuthorization(request, env);
+    if (authResult.errorResponse) return authResult.errorResponse;
 
-  const validationError = validateRacePayload(payload);
-  if (validationError) return validationError;
+    let payload;
+    try {
+      payload = await request.json();
+    } catch (error) {
+      return jsonResponse({ ok: false, error: "Invalid JSON body" }, 400);
+    }
 
-  const raceId = String(payload.race_id).trim();
+    const validationError = validateRacePayload(payload);
+    if (validationError) return validationError;
 
-  const existing = await env.DB.prepare("SELECT race_id FROM races WHERE race_id = ?").bind(raceId).first();
-  if (existing) {
-    await writeAuditLog(env, authResult.steward || request.stewardActor || null, "race_duplicate", "race", raceId, {
+    const raceId = String(payload.race_id).trim();
+
+    const existing = await env.DB.prepare("SELECT race_id, fingerprint FROM races WHERE race_id = ?").bind(raceId).first();
+    if (existing) {
+      await writeAuditLog(env, authResult.steward || request.stewardActor || null, "race_duplicate", "race", raceId, {
+        fingerprint: payload.fingerprint || null,
+        auth_mode: authResult.mode
+      });
+      return jsonResponse({
+        ok: false,
+        duplicate: true,
+        error: "Duplicate race_id",
+        race_id: raceId,
+        fingerprint: existing.fingerprint || null,
+        version: BACKEND_VERSION
+      }, 409);
+    }
+
+    const receivedAt = new Date().toISOString();
+
+    await env.DB.prepare("INSERT INTO races (race_id, scraped_at, received_at, fingerprint) VALUES (?, ?, ?, ?)")
+      .bind(raceId, payload.scraped_at, receivedAt, payload.fingerprint || null)
+      .run();
+
+    for (const result of payload.results) {
+      const position = normalizePosition(result.position);
+      const points = POINTS_BY_POSITION[position] || 0;
+
+      await env.DB.prepare("INSERT INTO race_results (race_id, position, driver_name, race_time, points) VALUES (?, ?, ?, ?, ?)")
+        .bind(raceId, position, String(result.name || "").trim(), result.time ? String(result.time).trim() : null, points)
+        .run();
+    }
+
+    await writeAuditLog(env, authResult.steward || request.stewardActor || null, "race_ingest", "race", raceId, {
+      results: payload.results.length,
       fingerprint: payload.fingerprint || null,
       auth_mode: authResult.mode
     });
+
+    return jsonResponse({
+      ok: true,
+      message: "Race ingested",
+      race_id: raceId,
+      results: payload.results.length,
+      fingerprint: payload.fingerprint || null,
+      version: BACKEND_VERSION,
+      steward: authResult.steward ? {
+        id: authResult.steward.id,
+        display_name: authResult.steward.display_name,
+        role: authResult.steward.role
+      } : null,
+      auth_mode: authResult.mode
+    });
+  } catch (error) {
     return jsonResponse({
       ok: false,
-      duplicate: true,
-      error: "Duplicate race_id",
-      race_id: raceId,
-      fingerprint: existing.fingerprint || null,
+      error: "Race ingest server error",
+      detail: String(error && error.message ? error.message : error),
       version: BACKEND_VERSION
-    }, 409);
+    }, 500);
   }
-
-  const receivedAt = new Date().toISOString();
-
-  await env.DB.prepare("INSERT INTO races (race_id, scraped_at, received_at, fingerprint) VALUES (?, ?, ?, ?)")
-    .bind(raceId, payload.scraped_at, receivedAt, payload.fingerprint || null)
-    .run();
-
-  for (const result of payload.results) {
-    const position = normalizePosition(result.position);
-    const points = POINTS_BY_POSITION[position] || 0;
-
-    await env.DB.prepare("INSERT INTO race_results (race_id, position, driver_name, race_time, points) VALUES (?, ?, ?, ?, ?)")
-      .bind(raceId, position, String(result.name || "").trim(), result.time ? String(result.time).trim() : null, points)
-      .run();
-  }
-
-  await writeAuditLog(env, authResult.steward || request.stewardActor || null, "race_ingest", "race", raceId, {
-    results: payload.results.length,
-    fingerprint: payload.fingerprint || null,
-    auth_mode: authResult.mode
-  });
-
-  return jsonResponse({
-    ok: true,
-    message: "Race ingested",
-    race_id: raceId,
-    results: payload.results.length,
-    fingerprint: payload.fingerprint || null,
-    version: BACKEND_VERSION,
-    steward: authResult.steward ? {
-      id: authResult.steward.id,
-      display_name: authResult.steward.display_name,
-      role: authResult.steward.role
-    } : null,
-    auth_mode: authResult.mode
-  });
 }
 
 
