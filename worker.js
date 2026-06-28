@@ -1,5 +1,5 @@
 // Nuclear Family League Server
-// Backend Version: v1.0.11
+// Backend Version: v1.0.12
 //
 // Cloudflare bindings expected:
 // - DB: D1 database
@@ -7,7 +7,7 @@
 // - ADMIN_TOKEN: Worker secret
 
 const SERVICE_NAME = "nuclear-family-league-server";
-const BACKEND_VERSION = "v1.0.11";
+const BACKEND_VERSION = "v1.0.12";
 
 const POINTS_BY_POSITION = {
   1: 25, 2: 18, 3: 15, 4: 12, 5: 10,
@@ -42,6 +42,11 @@ export default {
     if (request.method === "GET" && url.pathname === "/championship/unassigned-races") return handleUnassignedRaces(request, env);
     if (request.method === "POST" && url.pathname === "/championship/assign-race") return handleAssignRaceToEvent(request, env);
     if (request.method === "GET" && url.pathname === "/championship/standings") return handleChampionshipStandings(request, env);
+    if (request.method === "GET" && url.pathname === "/competition/templates") return handleCompetitionTemplates(request, env);
+    if (request.method === "GET" && url.pathname === "/competition/competitions") return handleListCompetitions(request, env);
+    if (request.method === "POST" && url.pathname === "/competition/competitions") return handleCreateCompetition(request, env);
+    if (request.method === "GET" && url.pathname === "/competition/participants") return handleListCompetitionParticipants(request, env);
+    if (request.method === "POST" && url.pathname === "/competition/participants/import") return handleImportCompetitionParticipants(request, env);
 
     return jsonResponse({ ok: false, error: "Not found" }, 404);
   }
@@ -109,7 +114,7 @@ async function runConfigChecks(env, includeTables) {
   }
 
   if (includeTables && checks.db.status === "connected") {
-    const tableNames = ["races", "race_results", "stewards", "steward_sessions", "audit_log", "seasons", "events", "event_races"];
+    const tableNames = ["races", "race_results", "stewards", "steward_sessions", "audit_log", "seasons", "events", "event_races", "competitions", "competition_participants", "competition_divisions"];
     for (const tableName of tableNames) {
       try {
         await env.DB.prepare(`SELECT COUNT(*) AS count FROM ${tableName}`).first();
@@ -612,6 +617,285 @@ async function handleChampionshipStandings(request, env) {
     WHERE e.season_id=? GROUP BY rr.driver_name
     ORDER BY points DESC,wins DESC,podiums DESC,avg_finish ASC,driver_name ASC`).bind(seasonId).all();
   return jsonResponse({ok:true,season_id:seasonId,standings:rows.results || []});
+}
+
+
+function getCompetitionTemplates() {
+  return {
+    JLT: {
+      id: "JLT",
+      name: "JLT-style League",
+      description: "League/group championship with registration roster, RS/class grouping, qualification phase, championship week, and group-size points.",
+      default_config: {
+        phases: ["registration", "qualification_phase", "championship_week"],
+        grouping: {
+          by_class: true,
+          by_racing_skill: true,
+          max_group_size: 80
+        },
+        scoring: {
+          type: "group_size_descending",
+          missed_race_points: 0,
+          crash_policy: "last_place_completion_tiebreak"
+        },
+        schedule: {
+          qp_races: 7,
+          qp_laps: 50,
+          cw_races: 7,
+          cw_laps: 20
+        },
+        advancement: {
+          type: "league_rank"
+        }
+      }
+    },
+    URT: {
+      id: "URT",
+      name: "URT-style Qualifier",
+      description: "Qualifier tournament where fastest times on selected tracks advance to a main tournament/final phase.",
+      default_config: {
+        phases: ["registration", "qualifiers", "main_tournament"],
+        qualifier: {
+          tracks: [],
+          laps: 10,
+          fastest_per_track: 16,
+          best_time_per_player_per_track: true
+        },
+        scoring: {
+          type: "time_trial_rank"
+        },
+        advancement: {
+          type: "top_n_per_track"
+        }
+      }
+    },
+    CUSTOM: {
+      id: "CUSTOM",
+      name: "Custom Competition",
+      description: "Blank competition template for experimental league formats.",
+      default_config: {
+        phases: [],
+        grouping: {},
+        scoring: { type: "standard_points" },
+        advancement: {}
+      }
+    }
+  };
+}
+
+async function handleCompetitionTemplates(request, env) {
+  return jsonResponse({ ok: true, templates: getCompetitionTemplates() });
+}
+
+async function handleListCompetitions(request, env) {
+  const url = new URL(request.url);
+  const status = sanitizeText(url.searchParams.get("status") || "", 30);
+
+  let rows;
+  if (status) {
+    rows = await env.DB.prepare(`
+      SELECT id, name, template_type, status, season_id, config_json, created_at, created_by
+      FROM competitions
+      WHERE status = ?
+      ORDER BY id DESC
+    `).bind(status).all();
+  } else {
+    rows = await env.DB.prepare(`
+      SELECT id, name, template_type, status, season_id, config_json, created_at, created_by
+      FROM competitions
+      ORDER BY id DESC
+    `).all();
+  }
+
+  return jsonResponse({ ok: true, competitions: rows.results || [] });
+}
+
+async function handleCreateCompetition(request, env) {
+  const auth = await requireChampionshipAdmin(request, env);
+  if (auth.error) return auth.error;
+
+  let payload;
+  try {
+    payload = await request.json();
+  } catch (error) {
+    return jsonResponse({ ok: false, error: "Invalid JSON body" }, 400);
+  }
+
+  const name = sanitizeText(payload.name, 100);
+  const templateType = sanitizeText(payload.template_type || "CUSTOM", 20).toUpperCase();
+  const seasonId = payload.season_id ? Number(payload.season_id) : null;
+  const templates = getCompetitionTemplates();
+
+  if (!name) return jsonResponse({ ok: false, error: "Competition name required" }, 400);
+  if (!templates[templateType]) return jsonResponse({ ok: false, error: "Unknown competition template" }, 400);
+
+  let config = templates[templateType].default_config;
+  if (payload.config && typeof payload.config === "object") {
+    config = Object.assign({}, config, payload.config);
+  }
+
+  const now = new Date().toISOString();
+
+  await env.DB.prepare(`
+    INSERT INTO competitions (name, template_type, status, season_id, config_json, created_at, created_by)
+    VALUES (?, ?, 'draft', ?, ?, ?, ?)
+  `).bind(
+    name,
+    templateType,
+    seasonId,
+    JSON.stringify(config),
+    now,
+    auth.actor && auth.actor.id ? auth.actor.id : null
+  ).run();
+
+  const competition = await env.DB.prepare(`
+    SELECT id, name, template_type, status, season_id, config_json, created_at, created_by
+    FROM competitions
+    ORDER BY id DESC
+    LIMIT 1
+  `).first();
+
+  await writeAuditLog(env, auth.actor, "competition_create", "competition", competition.id, {
+    name,
+    template_type: templateType,
+    season_id: seasonId
+  });
+
+  return jsonResponse({ ok: true, competition });
+}
+
+function parseParticipantRows(raw) {
+  if (Array.isArray(raw)) return raw;
+
+  const text = String(raw || "").trim();
+  if (!text) return [];
+
+  const lines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+  if (!lines.length) return [];
+
+  const delimiter = lines[0].includes("\t") ? "\t" : ",";
+  const header = lines[0].split(delimiter).map(h => h.trim().toLowerCase());
+
+  const rows = [];
+  for (let i = 1; i < lines.length; i++) {
+    const cells = lines[i].split(delimiter).map(c => c.trim());
+    const row = {};
+    header.forEach((h, idx) => row[h] = cells[idx] || "");
+    rows.push(row);
+  }
+
+  return rows;
+}
+
+function normalizeParticipant(row) {
+  row = row || {};
+  const tornId = sanitizeText(row.torn_id || row.tornid || row.id || row.player_id || "", 24);
+  const displayName = sanitizeText(row.display_name || row.name || row.player || row.username || "", 80);
+
+  return {
+    torn_id: tornId,
+    display_name: displayName,
+    faction: sanitizeText(row.faction || row.team || "", 80),
+    racing_skill: row.racing_skill !== undefined && row.racing_skill !== "" ? Number(row.racing_skill) : null,
+    racer_class: sanitizeText(row.racer_class || row.class || row.rs_class || "", 20),
+    car_class: sanitizeText(row.car_class || row.car || "", 20),
+    status: sanitizeText(row.status || "registered", 30),
+    notes: sanitizeText(row.notes || "", 300)
+  };
+}
+
+async function handleImportCompetitionParticipants(request, env) {
+  const auth = await requireChampionshipAdmin(request, env);
+  if (auth.error) return auth.error;
+
+  let payload;
+  try {
+    payload = await request.json();
+  } catch (error) {
+    return jsonResponse({ ok: false, error: "Invalid JSON body" }, 400);
+  }
+
+  const competitionId = Number(payload.competition_id);
+  if (!competitionId) return jsonResponse({ ok: false, error: "competition_id required" }, 400);
+
+  const competition = await env.DB.prepare("SELECT id FROM competitions WHERE id = ?").bind(competitionId).first();
+  if (!competition) return jsonResponse({ ok: false, error: "Competition not found" }, 404);
+
+  const rows = parseParticipantRows(payload.rows || payload.csv || payload.text || []);
+  if (!rows.length) return jsonResponse({ ok: false, error: "No participant rows supplied" }, 400);
+
+  const now = new Date().toISOString();
+  let imported = 0;
+  let skipped = 0;
+  const errors = [];
+
+  for (const rawRow of rows.slice(0, 1000)) {
+    const row = normalizeParticipant(rawRow);
+    if (!row.torn_id && !row.display_name) {
+      skipped++;
+      continue;
+    }
+
+    try {
+      await env.DB.prepare(`
+        INSERT INTO competition_participants (
+          competition_id, torn_id, display_name, faction, racing_skill, racer_class, car_class, status, notes, imported_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(competition_id, torn_id) DO UPDATE SET
+          display_name = excluded.display_name,
+          faction = excluded.faction,
+          racing_skill = excluded.racing_skill,
+          racer_class = excluded.racer_class,
+          car_class = excluded.car_class,
+          status = excluded.status,
+          notes = excluded.notes,
+          updated_at = excluded.updated_at
+      `).bind(
+        competitionId,
+        row.torn_id || null,
+        row.display_name || null,
+        row.faction || null,
+        row.racing_skill,
+        row.racer_class || null,
+        row.car_class || null,
+        row.status || "registered",
+        row.notes || null,
+        now,
+        now
+      ).run();
+
+      imported++;
+    } catch (error) {
+      skipped++;
+      errors.push(String(error && error.message ? error.message : error).slice(0, 200));
+    }
+  }
+
+  await writeAuditLog(env, auth.actor, "participants_import", "competition", competitionId, {
+    imported,
+    skipped,
+    errors: errors.slice(0, 5)
+  });
+
+  return jsonResponse({ ok: true, competition_id: competitionId, imported, skipped, errors: errors.slice(0, 10) });
+}
+
+async function handleListCompetitionParticipants(request, env) {
+  const url = new URL(request.url);
+  const competitionId = Number(url.searchParams.get("competition_id") || 0);
+
+  if (!competitionId) return jsonResponse({ ok: false, error: "competition_id required" }, 400);
+
+  const rows = await env.DB.prepare(`
+    SELECT id, competition_id, torn_id, display_name, faction, racing_skill, racer_class, car_class, division_id, group_name, status, imported_at, updated_at, notes
+    FROM competition_participants
+    WHERE competition_id = ?
+    ORDER BY racer_class ASC, racing_skill DESC, display_name ASC
+    LIMIT 2000
+  `).bind(competitionId).all();
+
+  return jsonResponse({ ok: true, competition_id: competitionId, participants: rows.results || [] });
 }
 
 async function handleRaceStatus(request, env) {
