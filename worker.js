@@ -1,5 +1,5 @@
 // Nuclear Family League Server
-// Backend Version: v1.0.12
+// Backend Version: v1.0.13
 //
 // Cloudflare bindings expected:
 // - DB: D1 database
@@ -7,7 +7,7 @@
 // - ADMIN_TOKEN: Worker secret
 
 const SERVICE_NAME = "nuclear-family-league-server";
-const BACKEND_VERSION = "v1.0.12";
+const BACKEND_VERSION = "v1.0.13";
 
 const POINTS_BY_POSITION = {
   1: 25, 2: 18, 3: 15, 4: 12, 5: 10,
@@ -19,6 +19,9 @@ export default {
     const url = new URL(request.url);
 
     if (request.method === "OPTIONS") return corsResponse(null, 204);
+
+    if (request.method === "POST" && url.pathname === "/admin/dev-reset") return handleAdminDevReset(request, env);
+    if ((request.method === "GET" || request.method === "POST") && url.pathname === "/admin/archive") return handleAdminArchive(request, env);
 
     if (request.method === "GET" && url.pathname === "/health") return handleHealth(env);
     if (request.method === "GET" && url.pathname === "/admin/health") return handleAdminHealth(request, env);
@@ -342,6 +345,7 @@ function parseStewardAction(pathname) {
 async function handleAdminUpdateSteward(request, env, stewardId) {
   const authError = await validateAdminAuthorization(request, env);
   if (authError) return authError;
+  const actorForAudit = await resolveActorFromAuthorization(request, env);
 
   if (!stewardId || stewardId < 1) return jsonResponse({ ok: false, error: "Invalid steward id" }, 400);
 
@@ -373,9 +377,11 @@ async function handleAdminUpdateSteward(request, env, stewardId) {
     WHERE id = ?
   `).bind(stewardId).first();
 
-  await writeAuditLog(env, actorForAudit, "steward_update", "steward", stewardId, { display_name: displayName, role: role });
-
-  await writeAuditLog(env, actorForAudit, "steward_active_change", "steward", stewardId, { active: active });
+  await writeAuditLog(env, actorForAudit, "steward_update", "steward", stewardId, {
+    display_name: displayName,
+    role: role,
+    notes_changed: !!notes
+  });
 
   return jsonResponse({ ok: true, steward: updated });
 }
@@ -997,6 +1003,213 @@ async function validateAdminAuthorization(request, env) {
       detail: String(error && error.message ? error.message : error)
     }, 500);
   }
+}
+
+
+
+async function requireSuperAdminAuthorization(request, env) {
+  const authError = await validateAdminAuthorization(request, env);
+  if (authError) return { error: authError, actor: null };
+
+  const actor = await resolveActorFromAuthorization(request, env);
+  const role = actor && actor.role ? String(actor.role) : "bootstrap";
+
+  if (role !== "bootstrap" && role !== "super_admin") {
+    return {
+      error: jsonResponse({ ok: false, error: "super_admin required", role }, 403),
+      actor
+    };
+  }
+
+  return { error: null, actor };
+}
+
+async function tableExists(env, tableName) {
+  const row = await env.DB.prepare(
+    "SELECT name FROM sqlite_master WHERE type='table' AND name = ? LIMIT 1"
+  ).bind(tableName).first();
+
+  return !!row;
+}
+
+async function deleteTableRows(env, tableName) {
+  const exists = await tableExists(env, tableName);
+  if (!exists) {
+    return {
+      table: tableName,
+      skipped: true,
+      reason: "missing table",
+      deleted: 0
+    };
+  }
+
+  const before = await env.DB.prepare(`SELECT COUNT(*) AS count FROM ${tableName}`).first();
+  await env.DB.prepare(`DELETE FROM ${tableName}`).run();
+  const after = await env.DB.prepare(`SELECT COUNT(*) AS count FROM ${tableName}`).first();
+
+  return {
+    table: tableName,
+    skipped: false,
+    deleted: Math.max(0, Number(before && before.count || 0) - Number(after && after.count || 0))
+  };
+}
+
+function getDevResetTables(scope) {
+  const scopes = {
+    standings: [
+      "race_results"
+    ],
+    assignments: [
+      "event_races"
+    ],
+    events: [
+      "event_races",
+      "events"
+    ],
+    seasons: [
+      "event_races",
+      "events",
+      "seasons"
+    ],
+    competitions: [
+      "competition_participants",
+      "competition_divisions",
+      "competitions"
+    ],
+    uploaded_races: [
+      "event_races",
+      "race_results",
+      "races"
+    ],
+    factory: [
+      "event_races",
+      "race_results",
+      "races",
+      "competition_participants",
+      "competition_divisions",
+      "competitions",
+      "events",
+      "seasons"
+    ]
+  };
+
+  return scopes[scope] || null;
+}
+
+async function handleAdminDevReset(request, env) {
+  const auth = await requireSuperAdminAuthorization(request, env);
+  if (auth.error) return auth.error;
+
+  let payload;
+  try {
+    payload = await request.json();
+  } catch (error) {
+    return jsonResponse({ ok: false, error: "Invalid JSON body" }, 400);
+  }
+
+  if (payload.confirm !== "DELETE") {
+    return jsonResponse({ ok: false, error: "Typed confirmation required", required: "DELETE" }, 400);
+  }
+
+  const scope = sanitizeText(payload.scope || "", 40);
+  const tables = getDevResetTables(scope);
+
+  if (!tables) {
+    return jsonResponse({
+      ok: false,
+      error: "Unknown reset scope",
+      supported_scopes: ["standings", "assignments", "events", "seasons", "competitions", "uploaded_races", "factory"]
+    }, 400);
+  }
+
+  const results = [];
+  for (const tableName of tables) {
+    results.push(await deleteTableRows(env, tableName));
+  }
+
+  const deletedTotal = results.reduce((sum, row) => sum + Number(row.deleted || 0), 0);
+
+  await writeAuditLog(env, auth.actor, "dev_reset", "scope", scope, {
+    deleted_total: deletedTotal,
+    results
+  });
+
+  return jsonResponse({
+    ok: true,
+    scope,
+    deleted_total: deletedTotal,
+    results,
+    version: BACKEND_VERSION
+  });
+}
+
+async function handleAdminArchive(request, env) {
+  const auth = await requireSuperAdminAuthorization(request, env);
+  if (auth.error) return auth.error;
+
+  if (request.method === "GET") {
+    return jsonResponse({
+      ok: true,
+      installed: true,
+      endpoint: "/admin/archive",
+      methods: ["GET", "POST"],
+      version: BACKEND_VERSION
+    });
+  }
+
+  let payload;
+  try {
+    payload = await request.json();
+  } catch (error) {
+    return jsonResponse({ ok: false, error: "Invalid JSON body" }, 400);
+  }
+
+  const targetType = sanitizeText(payload.type || payload.target_type || "season", 30);
+  const targetId = Number(payload.id || payload.season_id || payload.competition_id || 0);
+
+  if (!targetId) return jsonResponse({ ok: false, error: "Archive target id required" }, 400);
+
+  let tableName;
+  if (targetType === "competition" || targetType === "series") tableName = "competitions";
+  else tableName = "seasons";
+
+  if (!(await tableExists(env, tableName))) {
+    return jsonResponse({ ok: false, error: "Archive table missing", table: tableName }, 500);
+  }
+
+  const info = await env.DB.prepare(`PRAGMA table_info(${tableName})`).all();
+  const columns = (info.results || []).map(row => row.name);
+
+  if (columns.includes("archived_at")) {
+    await env.DB.prepare(`UPDATE ${tableName} SET archived_at = ? WHERE id = ?`)
+      .bind(new Date().toISOString(), targetId)
+      .run();
+  } else if (columns.includes("status")) {
+    await env.DB.prepare(`UPDATE ${tableName} SET status = 'archived' WHERE id = ?`)
+      .bind(targetId)
+      .run();
+  } else {
+    return jsonResponse({
+      ok: false,
+      error: "No compatible archive column found",
+      table: tableName,
+      expected_one_of: ["archived_at", "status"]
+    }, 500);
+  }
+
+  await writeAuditLog(env, auth.actor, "archive", tableName, targetId, {
+    target_type: targetType,
+    table: tableName
+  });
+
+  return jsonResponse({
+    ok: true,
+    archived: true,
+    target_type: targetType,
+    table: tableName,
+    id: targetId,
+    version: BACKEND_VERSION
+  });
 }
 
 
